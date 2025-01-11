@@ -1949,18 +1949,35 @@ func checkResourceAttrMap(name, key string, expected map[string]string) resource
 	return resource.ComposeAggregateTestCheckFunc(checks...)
 }
 
-func checkDeploymentReplicasAndGeneration(name, namespace, deploymentName string, replicas int32, generation int64) resource.TestCheckFunc {
-	deploymentKey := fmt.Sprintf("resources.deployment.apps/v1/%s/%s", namespace, deploymentName)
-	return resource.TestCheckResourceAttrWith(name, deploymentKey, func(value string) error {
-		var deployment appsv1.Deployment
-		if err := json.Unmarshal([]byte(value), &deployment); err != nil {
+func checkKubeResource(name, kindGroupVersion, namespace, resourceName string, checkFunc resource.CheckResourceAttrWithFunc) resource.TestCheckFunc {
+	key := fmt.Sprintf("resources.%s/%s/%s", kindGroupVersion, namespace, resourceName)
+	return resource.TestCheckResourceAttrWith(name, key, checkFunc)
+}
+
+func checkDeploymentReplicasAndGeneration(t *testing.T, name, namespace, deploymentName string, replicas int32, generation int64) resource.TestCheckFunc {
+	return checkKubeResource(name, "deployment.apps/v1", namespace, deploymentName, func(value string) error {
+		var stateDeployment appsv1.Deployment
+		if err := json.Unmarshal([]byte(value), &stateDeployment); err != nil {
 			return err
 		}
-		if deployment.Spec.Replicas == nil {
+		if stateDeployment.Spec.Replicas == nil {
 			return fmt.Errorf("expected replicas to be set")
 		}
-		if *deployment.Spec.Replicas != replicas {
-			return fmt.Errorf("expected replicas to be %d, got %d", replicas, *deployment.Spec.Replicas)
+		if *stateDeployment.Spec.Replicas != replicas {
+			return fmt.Errorf("expected replicas to be %d, got %d", replicas, *stateDeployment.Spec.Replicas)
+		}
+
+		kc, err := getTestKubeClient(namespace)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client, err := kc.Factory.KubernetesClientSet()
+		if err != nil {
+			t.Fatal(err)
+		}
+		deployment, err := client.AppsV1().Deployments(namespace).Get(context.Background(), deploymentName, metav1.GetOptions{})
+		if err != nil {
+			return err
 		}
 		if deployment.Generation != generation {
 			return fmt.Errorf("expected generation to be %d, got %d", generation, deployment.Generation)
@@ -2004,7 +2021,7 @@ func TestAccResourceRelease_manifestServerDiff(t *testing.T) {
 						}
 						return checkResourceAttrMap("helm_release.test", "resources", r)(state)
 					},
-					checkDeploymentReplicasAndGeneration("helm_release.test", namespace, fullName, 1, 1),
+					checkDeploymentReplicasAndGeneration(t, "helm_release.test", namespace, fullName, 1, 1),
 				),
 			},
 			{
@@ -2012,14 +2029,14 @@ func TestAccResourceRelease_manifestServerDiff(t *testing.T) {
 				// config to restore the replicas to 1 (generation 3)
 				PreConfig: patchDeployment(t, namespace, fullName, []byte(`{"spec":{"replicas":2}}`)),
 				Config:    config,
-				Check:     checkDeploymentReplicasAndGeneration("helm_release.test", namespace, fullName, 1, 3),
+				Check:     checkDeploymentReplicasAndGeneration(t, "helm_release.test", namespace, fullName, 1, 3),
 			},
 			{
 				// patch the deployment to have 2 replicas (generation 4) then apply a
 				// new config to set the replicas to 3 (generation 5)
 				PreConfig: patchDeployment(t, namespace, fullName, []byte(`{"spec":{"replicas":2}}`)),
 				Config:    testAccHelmReleaseConfigManifestExperimentEnabledSetReplicas(testResourceName, namespace, name, "1.2.3"),
-				Check:     checkDeploymentReplicasAndGeneration("helm_release.test", namespace, fullName, 3, 5),
+				Check:     checkDeploymentReplicasAndGeneration(t, "helm_release.test", namespace, fullName, 3, 5),
 			},
 			{
 				// patch the deployment to have 1 replicas (generation 6) then apply the
@@ -2027,7 +2044,7 @@ func TestAccResourceRelease_manifestServerDiff(t *testing.T) {
 				// to the previous value of 3 (generation 7)
 				PreConfig: patchDeployment(t, namespace, fullName, []byte(`{"spec":{"replicas":1}}`)),
 				Config:    config,
-				Check:     checkDeploymentReplicasAndGeneration("helm_release.test", namespace, fullName, 3, 7),
+				Check:     checkDeploymentReplicasAndGeneration(t, "helm_release.test", namespace, fullName, 3, 7),
 			},
 			{
 				// patch the deployment to have 1 replicas (generation 8) then apply the
@@ -2035,7 +2052,60 @@ func TestAccResourceRelease_manifestServerDiff(t *testing.T) {
 				// is reset to the chart's default value of 1 (generation 8, no changes)
 				PreConfig: patchDeployment(t, namespace, fullName, []byte(`{"spec":{"replicas":1}}`)),
 				Config:    testAccHelmReleaseConfigManifestExperimentEnabledResetValues(testResourceName, namespace, name, "1.2.3"),
-				Check:     checkDeploymentReplicasAndGeneration("helm_release.test", namespace, fullName, 1, 8),
+				Check:     checkDeploymentReplicasAndGeneration(t, "helm_release.test", namespace, fullName, 1, 8),
+			},
+			{
+				// set `ignore_resource_fields` to ignore `spec.template.spec.serviceAccountName`
+				// (and the deprecated `serviceAccount` field) along with some other fields
+				Config: testAccHelmReleaseConfigManifestExperimentEnabledIgnoreFields(testResourceName, namespace, name, "1.2.3"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					checkDeploymentReplicasAndGeneration(t, "helm_release.test", namespace, fullName, 1, 8),
+					// check that the ignore fields are not present in the state
+					checkKubeResource("helm_release.test", "deployment.apps/v1", namespace, fullName, func(value string) error {
+						var deployment map[string]interface{}
+						if err := json.Unmarshal([]byte(value), &deployment); err != nil {
+							return err
+						}
+						if _, ok := deployment["metadata"].(map[string]interface{})["generation"]; ok {
+							return fmt.Errorf("expected generation to be ignored")
+						}
+						podSpec := deployment["spec"].(map[string]interface{})["template"].(map[string]interface{})["spec"].(map[string]interface{})
+						if _, ok := podSpec["serviceAccountName"]; ok {
+							return fmt.Errorf("expected serviceAccountName to be ignored")
+						}
+						if _, ok := podSpec["serviceAccount"]; ok {
+							return fmt.Errorf("expected serviceAccount to be ignored")
+						}
+						if _, ok := deployment["metadata"].(map[string]interface{})["labels"]; ok {
+							return fmt.Errorf("expected labels to be ignored")
+						}
+						if _, ok := deployment["status"]; ok {
+							return fmt.Errorf("expected status to be ignored")
+						}
+						return nil
+					}),
+					checkKubeResource("helm_release.test", "service/v1", namespace, fullName, func(value string) error {
+						var service map[string]interface{}
+						if err := json.Unmarshal([]byte(value), &service); err != nil {
+							return err
+						}
+						if _, ok := service["metadata"].(map[string]interface{})["generation"]; ok {
+							return fmt.Errorf("expected generation to be ignored")
+						}
+						if _, ok := service["metadata"].(map[string]interface{})["labels"]; ok {
+							return fmt.Errorf("expected labels to be ignored")
+						}
+						return nil
+					}),
+				),
+			},
+			{
+				// patch the deployment to use the `default` service account (generation 9)
+				// then apply it with the `ignore_resource_fields` settings so no changes
+				// will be applied (generation 9)
+				PreConfig: patchDeployment(t, namespace, fullName, []byte(`{"spec":{"template":{"spec":{"serviceAccountName":"default"}}}}`)),
+				Config:    testAccHelmReleaseConfigManifestExperimentEnabledIgnoreFields(testResourceName, namespace, name, "1.2.3"),
+				Check:     checkDeploymentReplicasAndGeneration(t, "helm_release.test", namespace, fullName, 1, 9),
 			},
 			{
 				// delete the service then apply the previous config to recreate it
@@ -2510,6 +2580,45 @@ func testAccHelmReleaseConfigManifestExperimentEnabled(resource, ns, name, versi
 			chart       = "test-chart"
 		}
 	`, resource, name, ns, testRepositoryURL, version)
+}
+
+func testAccHelmReleaseConfigManifestExperimentEnabledIgnoreFields(resource, ns, name, version string) string {
+	return fmt.Sprintf(`
+		provider helm {
+			experiments {
+				manifest = true
+			}
+		}
+		resource "helm_release" "%s" {
+ 			name        = %q
+			namespace   = %q
+			repository  = %q
+			version     = %q
+			chart       = "test-chart"
+			ignore_resource_fields {
+				key_regex   = "^deployment\\.apps/.*"
+				fields_json = jsonencode({
+					spec = {
+						template = {
+							spec = {
+								serviceAccountName = null
+								serviceAccount     = null
+							}
+						}
+					}
+					status = null
+				})
+			}
+			ignore_resource_fields {
+				key_regex   = "/%s/%s-test-chart$"
+				fields_json = jsonencode({
+					metadata = {
+						labels = null
+					}
+				})
+			}
+		}
+	`, resource, name, ns, testRepositoryURL, version, ns, name)
 }
 
 func testAccHelmReleaseConfigManifestExperimentEnabledResetValues(resource, ns, name, version string) string {

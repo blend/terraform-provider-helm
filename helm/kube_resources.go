@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -30,6 +31,7 @@ import (
 	"k8s.io/kubectl/pkg/cmd/diff"
 	"k8s.io/kubectl/pkg/scheme"
 	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
+	"sigs.k8s.io/structured-merge-diff/v4/value"
 )
 
 func getKubeClient(actionConfig *action.Configuration) (*kube.Client, error) {
@@ -55,9 +57,14 @@ func regenerateGVKParser(dc discovery.DiscoveryInterface) (*managedfields.GvkPar
 	return managedfields.NewGVKParser(models, false)
 }
 
+type resourceIgnore struct {
+	keyRegex   *regexp.Regexp
+	fieldsJSON string
+}
+
 // removeUnmanagedFields removes fields updated by `kube-controller-manager` or
 // through subresource apis from a kubernetes object
-func removeUnmanagedFields(parser *managedfields.GvkParser, obj runtime.Object, gvk schema.GroupVersionKind) error {
+func removeUnmanagedFields(parser *managedfields.GvkParser, obj runtime.Object, gvk schema.GroupVersionKind, ignoreFieldsJSONs []string) error {
 	parseableType := parser.Type(gvk)
 	if parseableType == nil {
 		return errors.Errorf("no parseable type found for %s", gvk.String())
@@ -81,6 +88,14 @@ func removeUnmanagedFields(parser *managedfields.GvkParser, obj runtime.Object, 
 			fieldSet = fieldSet.Union(fs)
 		}
 	}
+	fieldSet.Insert(fieldpath.MakePathOrDie("metadata", "generation"))
+	for _, fieldsJSON := range ignoreFieldsJSONs {
+		fieldsValue, err := value.FromJSON([]byte(fieldsJSON))
+		if err != nil {
+			return err
+		}
+		fieldSet = fieldSet.Union(fieldpath.SetFromValue(fieldsValue))
+	}
 	u := typedObj.RemoveItems(fieldSet).AsValue().Unstructured()
 	m, ok := u.(map[string]interface{})
 	if !ok {
@@ -99,6 +114,15 @@ func mapRuntimeObjects(kc *kube.Client, objects []runtime.Object, d resourceGett
 	parser, err := regenerateGVKParser(clientSet.Discovery())
 	if err != nil {
 		return nil, err
+	}
+
+	var resourceIgnores []resourceIgnore
+	for _, ignoreElem := range d.Get("ignore_resource_fields").([]interface{}) {
+		ignore := ignoreElem.(map[string]interface{})
+		resourceIgnores = append(resourceIgnores, resourceIgnore{
+			keyRegex:   regexp.MustCompile(ignore["key_regex"].(string)),
+			fieldsJSON: ignore["fields_json"].(string),
+		})
 	}
 
 	mappedObjects := make(map[string]string)
@@ -123,7 +147,13 @@ func mapRuntimeObjects(kc *kube.Client, objects []runtime.Object, d resourceGett
 			accessor.GetNamespace(),
 			accessor.GetName(),
 		)
-		if err := removeUnmanagedFields(parser, obj, gvk); err != nil {
+		var ignoreFieldsJSONs []string
+		for _, ignore := range resourceIgnores {
+			if ignore.keyRegex.MatchString(key) {
+				ignoreFieldsJSONs = append(ignoreFieldsJSONs, ignore.fieldsJSON)
+			}
+		}
+		if err := removeUnmanagedFields(parser, obj, gvk, ignoreFieldsJSONs); err != nil {
 			return nil, err
 		}
 		accessor.SetUID(types.UID(""))

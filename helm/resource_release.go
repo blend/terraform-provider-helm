@@ -396,6 +396,25 @@ func resourceRelease() *schema.Resource {
 					Description: "The information of a kubernetes resource as JSON.",
 				},
 			},
+			"ignore_resource_fields": {
+				Type:        schema.TypeList,
+				Optional:    true,
+				Description: "List of kubernetes resource fields to be ignored in the state.",
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"key_regex": {
+							Type:        schema.TypeString,
+							Required:    true,
+							Description: "The resource key regex to ignore.",
+						},
+						"fields_json": {
+							Type:        schema.TypeString,
+							Required:    true,
+							Description: "The fields to ignore in their position in the resource(s), in JSON format. The values are disregard. For example, `{\"metadata\": {\"annotations\": null}, \"status\": null}` means `.metadata.annotations` and `.status`.",
+						},
+					},
+				},
+			},
 			"upgrade_install": {
 				Type:        schema.TypeBool,
 				Optional:    true,
