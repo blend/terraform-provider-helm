@@ -894,11 +894,11 @@ func resourceReleaseDelete(ctx context.Context, d *schema.ResourceData, meta int
 	uninstall.Timeout = time.Duration(d.Get("timeout").(int)) * time.Second
 
 	res, err := uninstall.Run(name)
-	if err != nil {
+	if err != nil && !errors.Is(err, driver.ErrReleaseNotFound) {
 		return diag.FromErr(err)
 	}
 
-	if res.Info != "" {
+	if res != nil && res.Info != "" {
 		return diag.Diagnostics{
 			{
 				Severity: diag.Warning,
@@ -964,18 +964,16 @@ func resourceDiff(ctx context.Context, d *schema.ResourceDiff, meta interface{})
 	}
 	if d.HasChanges(recomputeMetadataFields...) {
 		d.SetNewComputed("metadata")
-	}
-
-	if !useChartVersion(d.Get("chart").(string), d.Get("repository").(string)) {
-		if d.HasChange("version") {
+	} else if !useChartVersion(d.Get("chart").(string), d.Get("repository").(string)) {
+		if d.HasChange("metadata.0.version") {
 			// only recompute metadata if the version actually changes
 			// chart versioning is not consistent and some will add
 			// a `v` prefix to the chart version after installation
-			old, new := d.GetChange("version")
+			old, new := d.GetChange("metadata.0.version")
 			oldVersion := strings.TrimPrefix(old.(string), "v")
 			newVersion := strings.TrimPrefix(new.(string), "v")
 			debug("%s oldVersion: %s, newVersion: %s", logID, oldVersion, newVersion)
-			if oldVersion != newVersion && newVersion != "" {
+			if oldVersion != newVersion {
 				d.SetNewComputed("metadata")
 			}
 		}

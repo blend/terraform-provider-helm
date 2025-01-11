@@ -1,3 +1,22 @@
+## 2.16.1 (Oct 15, 2024)
+
+BUG FIXES:
+
+* `helm_release`: Fix nil pointer deref panic on destroy when helm release is not found [[GH-1501](https://github.com/hashicorp/terraform-provider-helm/issues/1501)]
+
+## 2.16.0 (Oct 10, 2024)
+
+BUG FIXES:
+
+* `helm_release`: On destroy, do not error when release is not found [[GH-1487](https://github.com/hashicorp/terraform-provider-helm/issues/1487)]
+* `resource/helm_release`: Fix: only recompute metadata when the version in the metadata changes [[GH-1458](https://github.com/hashicorp/terraform-provider-helm/issues/1458)]
+
+## 2.15.0 (Aug 14, 2024)
+
+ENHANCEMENT:
+
+* resource/helm_release: add `upgrade_install` boolean attribute to enable idempotent release installation, addressing components of [GH-425](https://github.com/hashicorp/terraform-provider-helm/issues/425) [[GH-1247](https://github.com/hashicorp/terraform-provider-helm/issues/1247)]
+
 ## 2.14.1 (Aug 7, 2024)
 
 DEPENDENCIES:
