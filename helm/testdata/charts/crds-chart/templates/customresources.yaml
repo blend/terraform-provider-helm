@@ -1,0 +1,6 @@
+{{- range .Values.customResources }}
+{{- if and (ne .kind "Apple") (ne .kind "Orange") }}{{- fail (printf "Unsupported custom resource kind: %s" .kind) }}{{ end }}
+{{- toYaml . }}
+
+---
+{{- end }}

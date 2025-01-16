@@ -36,27 +36,28 @@ var errReleaseNotFound = errors.New("release not found")
 
 // defaultAttributes release attribute values
 var defaultAttributes = map[string]interface{}{
-	"verify":                     false,
-	"timeout":                    300,
-	"wait":                       true,
-	"wait_for_jobs":              false,
-	"disable_webhooks":           false,
-	"atomic":                     false,
-	"render_subchart_notes":      true,
-	"disable_openapi_validation": false,
-	"disable_crd_hooks":          false,
-	"force_update":               false,
-	"reset_values":               false,
-	"reuse_values":               false,
-	"recreate_pods":              false,
-	"max_history":                0,
-	"skip_crds":                  false,
-	"cleanup_on_fail":            false,
-	"dependency_update":          false,
-	"replace":                    false,
-	"create_namespace":           false,
-	"lint":                       false,
-	"pass_credentials":           false,
+	"verify":                        false,
+	"timeout":                       300,
+	"wait":                          true,
+	"wait_for_jobs":                 false,
+	"disable_webhooks":              false,
+	"atomic":                        false,
+	"render_subchart_notes":         true,
+	"disable_openapi_validation":    false,
+	"disable_crd_hooks":             false,
+	"force_update":                  false,
+	"reset_values":                  false,
+	"reuse_values":                  false,
+	"recreate_pods":                 false,
+	"max_history":                   0,
+	"skip_crds":                     false,
+	"cleanup_on_fail":               false,
+	"dependency_update":             false,
+	"replace":                       false,
+	"create_namespace":              false,
+	"lint":                          false,
+	"pass_credentials":              false,
+	"force_update_custom_resources": true,
 }
 
 func resourceRelease() *schema.Resource {
@@ -414,6 +415,12 @@ func resourceRelease() *schema.Resource {
 						},
 					},
 				},
+			},
+			"force_update_custom_resources": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     defaultAttributes["force_update_custom_resources"],
+				Description: "If true, the provider will force resource updates if any chart custom resources would be changed. Defaults to `true`.",
 			},
 			"upgrade_install": {
 				Type:        schema.TypeBool,
@@ -862,6 +869,13 @@ func resourceReleaseUpdate(ctx context.Context, d *schema.ResourceData, meta int
 	if err != nil {
 		d.Partial(true)
 		return diag.FromErr(err)
+	}
+
+	if !client.Force {
+		client.Force, err = shouldForceUpdateCustomResources(c, m, d)
+		if err != nil {
+			return diag.FromErr(err)
+		}
 	}
 
 	name := d.Get("name").(string)

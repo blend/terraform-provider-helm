@@ -12,16 +12,19 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/pkg/errors"
 	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/kube"
 	"helm.sh/helm/v3/pkg/release"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	runtimeschema "k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/managedfields"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
@@ -32,6 +35,7 @@ import (
 	"k8s.io/kubectl/pkg/scheme"
 	"sigs.k8s.io/structured-merge-diff/v4/fieldpath"
 	"sigs.k8s.io/structured-merge-diff/v4/value"
+	"sigs.k8s.io/yaml"
 )
 
 func getKubeClient(actionConfig *action.Configuration) (*kube.Client, error) {
@@ -64,7 +68,7 @@ type resourceIgnore struct {
 
 // removeUnmanagedFields removes fields updated by `kube-controller-manager` or
 // through subresource apis from a kubernetes object
-func removeUnmanagedFields(parser *managedfields.GvkParser, obj runtime.Object, gvk schema.GroupVersionKind, ignoreFieldsJSONs []string) error {
+func removeUnmanagedFields(parser *managedfields.GvkParser, obj runtime.Object, gvk runtimeschema.GroupVersionKind, ignoreFieldsJSONs []string) error {
 	parseableType := parser.Type(gvk)
 	if parseableType == nil {
 		return errors.Errorf("no parseable type found for %s", gvk.String())
@@ -251,4 +255,50 @@ func getDryRunResources(r *release.Release, m *Meta, d resourceGetter) (map[stri
 		}
 		return info.Merged()
 	})
+}
+
+func getChartCRDs(c *chart.Chart) ([]apiextensionsv1.CustomResourceDefinition, error) {
+	var crds []apiextensionsv1.CustomResourceDefinition
+	for _, crdObject := range c.CRDObjects() {
+		var crd apiextensionsv1.CustomResourceDefinition
+		if err := yaml.Unmarshal(crdObject.File.Data, &crd); err != nil {
+			return nil, err
+		}
+		crds = append(crds, crd)
+	}
+	return crds, nil
+}
+
+func shouldForceUpdateCustomResources(c *chart.Chart, m *Meta, d *schema.ResourceData) (bool, error) {
+	if !m.ExperimentEnabled("manifest") ||
+		!d.Get("force_update_custom_resources").(bool) ||
+		!d.HasChange("resources") {
+		return false, nil
+	}
+
+	// force update if any custom resource has changed
+	oldResources, newResources := d.GetChange("resources")
+	oldResourcesMap := oldResources.(map[string]interface{})
+	newResourcesMap := newResources.(map[string]interface{})
+	crds, err := getChartCRDs(c)
+	if err != nil {
+		return false, err
+	}
+	if len(crds) == 0 {
+		return false, nil
+	}
+	crdGroupKinds := make(map[string]struct{})
+	for _, crd := range crds {
+		crdGroupKinds[fmt.Sprintf("%s.%s", crd.Spec.Names.Singular, crd.Spec.Group)] = struct{}{}
+	}
+	for key, newResource := range newResourcesMap {
+		groupKind := strings.SplitN(key, "/", 2)[0]
+		if _, ok := crdGroupKinds[groupKind]; ok {
+			if oldResource, ok := oldResourcesMap[key]; ok && oldResource == newResource {
+				continue
+			}
+			return true, nil
+		}
+	}
+	return false, nil
 }

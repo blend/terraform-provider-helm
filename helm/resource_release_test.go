@@ -2028,6 +2028,43 @@ func checkDeploymentReplicasAndGeneration(t *testing.T, name, namespace, deploym
 	})
 }
 
+func checkAppleCronSpecAndGeneration(t *testing.T, name, namespace, appleName, cronSpec string, generation int64) resource.TestCheckFunc {
+	return checkKubeResource(name, "apple.stable.example.com/v1", namespace, appleName, func(_ string) error {
+		var apple map[string]interface{}
+		kc, err := getTestKubeClient(namespace)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client, err := kc.Factory.KubernetesClientSet()
+		if err != nil {
+			t.Fatal(err)
+		}
+		res := client.RESTClient().Get().
+			AbsPath("/apis/stable.example.com/v1").
+			Resource("apples").
+			Namespace(namespace).
+			Name(appleName).
+			Do(context.Background())
+		if res.Error() != nil {
+			return res.Error()
+		}
+		appleJSON, err := res.Raw()
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(appleJSON, &apple); err != nil {
+			return err
+		}
+		if cs, ok := apple["spec"].(map[string]interface{})["cronSpec"].(string); !ok || cs != cronSpec {
+			return fmt.Errorf("expected cronSpec to be %q, got %q", cronSpec, cs)
+		}
+		if g, ok := apple["metadata"].(map[string]interface{})["generation"].(float64); !ok || int64(g) != generation {
+			return fmt.Errorf("expected generation to be %d, got %g, %s, %v", generation, g, string(appleJSON), apple)
+		}
+		return nil
+	})
+}
+
 func TestAccResourceRelease_manifestServerDiff(t *testing.T) {
 	name := randName("serverdiff")
 	namespace := createRandomNamespace(t)
@@ -2179,6 +2216,95 @@ func TestAccResourceRelease_manifestServerDiff(t *testing.T) {
 						return checkResourceAttrMap("helm_release.test", "resources", r)(state)
 					},
 				),
+			},
+		},
+	})
+}
+
+func TestAccResourceRelease_manifestServerDiffCRD(t *testing.T) {
+	name := randName("serverdiff-crd")
+	namespace := createRandomNamespace(t)
+	defer deleteNamespace(t, namespace)
+
+	cronSpec := "* * * * *"
+
+	config := testAccHelmReleaseConfigManifestExperimentEnabledWithAppleCronSpec(
+		testResourceName, namespace, name, "1.2.3", cronSpec, true)
+	configNoForce := testAccHelmReleaseConfigManifestExperimentEnabledWithAppleCronSpec(
+		testResourceName, namespace, name, "1.2.3", cronSpec, false)
+
+	fullName := fmt.Sprintf("%s-exapple", name)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			testAccPreCheck(t)
+		},
+		ProviderFactories: map[string]func() (*schema.Provider, error){
+			"helm": func() (*schema.Provider, error) {
+				return Provider(), nil
+			},
+		},
+		CheckDestroy: testAccCheckHelmReleaseDestroy(namespace),
+		Steps: []resource.TestStep{
+			{
+				// first install the CRDs
+				Config: testAccHelmReleaseConfigManifestExperimentEnabledWithCRDs(testResourceName, namespace, name, "1.2.3"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.name", name),
+					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.namespace", namespace),
+					resource.TestCheckResourceAttr("helm_release.test", "metadata.0.version", "1.2.3"),
+				),
+			},
+			{
+				// install the `apple` custom resource
+				Config: config,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					func(state *terraform.State) error {
+						t.Logf("getting JSON server resources for release %q", name)
+						r, err := getReleaseJSONResources(namespace, name)
+						if err != nil {
+							t.Fatal(err)
+						}
+						return checkResourceAttrMap("helm_release.test", "resources", r)(state)
+					},
+					checkAppleCronSpecAndGeneration(t, "helm_release.test", namespace, fullName, cronSpec, 1),
+				),
+			},
+			{
+				// patch the custom resource to remove the `cronSpec` field (generation 2).
+				// since helm doesn't do three-way merge on custom resources, applying
+				// the same config without forcing an update will not update the resource
+				// because the manifest diff will be empty. it will also cause perpetual
+				// diffs on the `resources` attribute.
+				PreConfig: func() {
+					kc, err := getTestKubeClient(namespace)
+					if err != nil {
+						t.Fatal(err)
+					}
+					client, err := kc.Factory.KubernetesClientSet()
+					if err != nil {
+						t.Fatal(err)
+					}
+					res := client.RESTClient().Patch(types.MergePatchType).
+						AbsPath("/apis/stable.example.com/v1").
+						Resource("apples").
+						Namespace(namespace).
+						Name(fullName).
+						Body([]byte(`{"spec":{"cronSpec":""}}`)).
+						Do(context.Background())
+					if res.Error() != nil {
+						t.Fatal(res.Error())
+					}
+				},
+				Config:             configNoForce,
+				Check:              checkAppleCronSpecAndGeneration(t, "helm_release.test", namespace, fullName, "", 2),
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				// apply the config with `force_update_custom_resources = true` to
+				// restore the `cronSpec` field (generation 3)
+				Config: config,
+				Check:  checkAppleCronSpecAndGeneration(t, "helm_release.test", namespace, fullName, cronSpec, 3),
 			},
 		},
 	})
@@ -2701,6 +2827,60 @@ func testAccHelmReleaseConfigManifestExperimentEnabledSetReplicas(resource, ns, 
 			}
 		}
 	`, resource, name, ns, testRepositoryURL, version)
+}
+
+func testAccHelmReleaseConfigManifestExperimentEnabledWithCRDs(resource, ns, name, version string) string {
+	return fmt.Sprintf(`
+		provider helm {
+			experiments {
+				manifest = true
+			}
+		}
+		resource "helm_release" "%s" {
+ 			name        = %q
+			namespace   = %q
+			repository  = %q
+			version     = %q
+			chart       = "crds-chart"
+		}
+	`, resource, name, ns, testRepositoryURL, version)
+}
+
+func testAccHelmReleaseConfigManifestExperimentEnabledWithAppleCronSpec(resource, ns, name, version, cronSpec string, force bool) string {
+	return fmt.Sprintf(`
+		provider helm {
+			experiments {
+				manifest = true
+			}
+		}
+		resource "helm_release" "%s" {
+ 			name        = %q
+			namespace   = %q
+			repository  = %q
+			version     = %q
+			chart       = "crds-chart"
+
+			force_update_custom_resources = %t
+
+			values = [
+				yamlencode({
+					customResources = [
+						{
+							apiVersion = "stable.example.com/v1"
+							kind       = "Apple"
+							metadata = {
+								name      = "%s-exapple"
+								namespace = %q
+							}
+							spec = {
+								cronSpec = %q
+							}
+						}
+					]
+				})
+			]
+		}
+	`, resource, name, ns, testRepositoryURL, version, force, name, ns, cronSpec)
 }
 
 func testAccHelmReleaseConfigManifestUnknownValues(resource, ns, name, version string) string {
