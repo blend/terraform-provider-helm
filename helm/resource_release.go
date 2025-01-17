@@ -871,14 +871,19 @@ func resourceReleaseUpdate(ctx context.Context, d *schema.ResourceData, meta int
 		return diag.FromErr(err)
 	}
 
+	name := d.Get("name").(string)
+
 	if !client.Force {
-		client.Force, err = shouldForceUpdateCustomResources(c, m, d)
+		r, err := getRelease(m, actionConfig, name)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+		client.Force, err = shouldForceUpdateCustomResources(actionConfig, r, m, d)
 		if err != nil {
 			return diag.FromErr(err)
 		}
 	}
 
-	name := d.Get("name").(string)
 	r, err := client.Run(name, c, values)
 	if err != nil {
 		d.Partial(true)

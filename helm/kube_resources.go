@@ -269,7 +269,7 @@ func getChartCRDs(c *chart.Chart) ([]apiextensionsv1.CustomResourceDefinition, e
 	return crds, nil
 }
 
-func shouldForceUpdateCustomResources(c *chart.Chart, m *Meta, d *schema.ResourceData) (bool, error) {
+func shouldForceUpdateCustomResources(actionConfig *action.Configuration, r *release.Release, m *Meta, d *schema.ResourceData) (bool, error) {
 	if !m.ExperimentEnabled("manifest") ||
 		!d.Get("force_update_custom_resources").(bool) ||
 		!d.HasChange("resources") {
@@ -280,20 +280,39 @@ func shouldForceUpdateCustomResources(c *chart.Chart, m *Meta, d *schema.Resourc
 	oldResources, newResources := d.GetChange("resources")
 	oldResourcesMap := oldResources.(map[string]interface{})
 	newResourcesMap := newResources.(map[string]interface{})
-	crds, err := getChartCRDs(c)
+	crds, err := getChartCRDs(r.Chart)
 	if err != nil {
 		return false, err
 	}
-	if len(crds) == 0 {
-		return false, nil
-	}
-	crdGroupKinds := make(map[string]struct{})
+	forceGroupKinds := make(map[string]struct{})
 	for _, crd := range crds {
-		crdGroupKinds[fmt.Sprintf("%s.%s", crd.Spec.Names.Singular, crd.Spec.Group)] = struct{}{}
+		forceGroupKinds[fmt.Sprintf("%s.%s", crd.Spec.Names.Singular, crd.Spec.Group)] = struct{}{}
+	}
+	resources, err := actionConfig.KubeClient.Build(bytes.NewBufferString(r.Manifest), false)
+	if err != nil {
+		return false, err
+	}
+	err = resources.Visit(func(i *resource.Info, err error) error {
+		versioned := kube.AsVersioned(i)
+		switch obj := versioned.(type) {
+		case *apiextensionsv1.CustomResourceDefinition:
+			forceGroupKinds[fmt.Sprintf("%s.%s", obj.Spec.Names.Singular, obj.Spec.Group)] = struct{}{}
+		// also force update resource kinds not recognized by helm as native k8s schemes
+		// https://github.com/helm/helm/blob/v3.15.3/pkg/kube/converter.go#L54-L69
+		case runtime.Unstructured:
+			forceGroupKinds[strings.ToLower(obj.GetObjectKind().GroupVersionKind().GroupKind().String())] = struct{}{}
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	if len(forceGroupKinds) == 0 {
+		return false, nil
 	}
 	for key, newResource := range newResourcesMap {
 		groupKind := strings.SplitN(key, "/", 2)[0]
-		if _, ok := crdGroupKinds[groupKind]; ok {
+		if _, ok := forceGroupKinds[groupKind]; ok {
 			if oldResource, ok := oldResourcesMap[key]; ok && oldResource == newResource {
 				continue
 			}
