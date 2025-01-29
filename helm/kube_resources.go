@@ -46,6 +46,27 @@ func getKubeClient(actionConfig *action.Configuration) (*kube.Client, error) {
 	return kc, nil
 }
 
+type filteredModels struct {
+	models proto.Models
+}
+
+var versionSuffix = regexp.MustCompile(`_v\d+$`)
+
+func (f *filteredModels) ListModels() []string {
+	var models []string
+	for _, model := range f.models.ListModels() {
+		if versionSuffix.MatchString(model) {
+			continue
+		}
+		models = append(models, model)
+	}
+	return models
+}
+
+func (f *filteredModels) LookupModel(name string) proto.Schema {
+	return f.models.LookupModel(name)
+}
+
 // regenerateGVKParser builds the parser from the raw OpenAPI schema.
 func regenerateGVKParser(dc discovery.DiscoveryInterface) (*managedfields.GvkParser, error) {
 	doc, err := dc.OpenAPISchema()
@@ -58,7 +79,7 @@ func regenerateGVKParser(dc discovery.DiscoveryInterface) (*managedfields.GvkPar
 		return nil, err
 	}
 
-	return managedfields.NewGVKParser(models, false)
+	return managedfields.NewGVKParser(&filteredModels{models}, false)
 }
 
 type resourceIgnore struct {
